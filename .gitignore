@@ -1,0 +1,15 @@
+.DS_Store
+
+# Build and generated output
+outputs/
+work/build/
+work/module-cache/
+
+# Swift and Xcode local noise
+.build/
+DerivedData/
+*.xcuserdata/
+*.xcuserstate
+
+# Temporary files
+*.tmp
