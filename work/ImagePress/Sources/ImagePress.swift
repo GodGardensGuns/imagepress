@@ -201,7 +201,7 @@ struct ContentView: View {
                     .foregroundStyle(isDropTargeted ? Color.accentColor : Color.secondary)
                 Text("Drop images or folders here")
                     .font(.title3.weight(.medium))
-                Text("JPEG, PNG, WebP, AVIF, HEIC, TIFF, BMP, GIF, and common camera RAW files are accepted.")
+                Text("JPEG, PNG, SVG, WebP, AVIF, HEIC, TIFF, BMP, GIF, and common camera RAW files are accepted.")
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 560)
@@ -799,6 +799,7 @@ enum OutputFormat: String, CaseIterable, Identifiable {
     case same
     case jpeg
     case png
+    case svg
     case webp
     case avif
     case heic
@@ -821,6 +822,7 @@ enum OutputFormat: String, CaseIterable, Identifiable {
         case .gif: return "GIF"
         case .bmp: return "BMP"
         case .jpeg2000: return "JPEG 2000"
+        case .svg: return "SVG"
         }
     }
 
@@ -836,12 +838,13 @@ enum OutputFormat: String, CaseIterable, Identifiable {
         case .gif: return "gif"
         case .bmp: return "bmp"
         case .jpeg2000: return "jp2"
+        case .svg: return "svg"
         }
     }
 
     var typeIdentifier: String? {
         switch self {
-        case .same, .webp:
+        case .same, .webp, .svg:
             return nil
         case .jpeg:
             return "public.jpeg"
@@ -893,6 +896,8 @@ enum OutputFormat: String, CaseIterable, Identifiable {
             return .bmp
         case "jp2", "j2k", "jpf", "jpx":
             return .jpeg2000
+        case "svg":
+            return .svg
         default:
             return .jpeg
         }
@@ -1041,6 +1046,7 @@ enum ImagePressError: LocalizedError {
     case cannotCreateImage(URL)
     case cannotCreateDestination(URL)
     case unsupportedOutput(String)
+    case unsupportedConversion(String)
     case writeFailed(URL)
     case webPEncoderMissing
     case avifEncoderMissing
@@ -1057,6 +1063,8 @@ enum ImagePressError: LocalizedError {
             return "Could not create \(url.lastPathComponent)"
         case .unsupportedOutput(let format):
             return "\(format) export is not supported by this Mac"
+        case .unsupportedConversion(let message):
+            return message
         case .writeFailed(let url):
             return "Could not write \(url.lastPathComponent)"
         case .webPEncoderMissing:
@@ -1122,12 +1130,6 @@ enum ImageCompressor {
     ) throws -> URL {
         try control?.checkCancellation()
 
-        guard let source = CGImageSourceCreateWithURL(input as CFURL, [
-            kCGImageSourceShouldCache: false
-        ] as CFDictionary) else {
-            throw ImagePressError.cannotReadImage(input)
-        }
-
         let format = OutputFormat.resolved(for: input, requested: settings.outputFormat)
         let outputURL = try FileUtilities.uniqueFile(
             parent: outputDirectory,
@@ -1135,6 +1137,31 @@ enum ImageCompressor {
             extensionName: format.fileExtension,
             usedFileNames: &usedFileNames
         )
+
+        if format == .svg {
+            guard input.isSVGFile else {
+                throw ImagePressError.unsupportedConversion("SVG export only works for SVG files.")
+            }
+
+            do {
+                try SVGCompressor.compress(input: input, output: outputURL, settings: settings, control: control)
+            } catch is CancellationError {
+                try? FileManager.default.removeItem(at: outputURL)
+                throw CancellationError()
+            }
+
+            return outputURL
+        }
+
+        if input.isSVGFile {
+            throw ImagePressError.unsupportedConversion("SVG files can only be exported as SVG.")
+        }
+
+        guard let source = CGImageSourceCreateWithURL(input as CFURL, [
+            kCGImageSourceShouldCache: false
+        ] as CFDictionary) else {
+            throw ImagePressError.cannotReadImage(input)
+        }
 
         do {
             if format == .webp {
@@ -1432,7 +1459,7 @@ enum ImageCompressor {
         case .jpeg, .avif, .heic, .jpeg2000:
             let quality = settings.method.quality(from: settings.quality)
             properties.setObject(quality as NSNumber, forKey: kCGImageDestinationLossyCompressionQuality as NSString)
-        case .png, .tiff, .gif, .bmp, .same, .webp:
+        case .png, .tiff, .gif, .bmp, .same, .webp, .svg:
             break
         }
 
@@ -1516,9 +1543,190 @@ enum ImageCompressor {
     }
 }
 
+enum SVGCompressor {
+    static func compress(
+        input: URL,
+        output: URL,
+        settings: CompressionSettings,
+        control: CompressionRunControl?
+    ) throws {
+        try control?.checkCancellation()
+
+        let originalData = try Data(contentsOf: input)
+        guard let sourceText = decodedSVGText(from: originalData),
+              sourceText.range(of: "<svg", options: [.caseInsensitive]) != nil else {
+            throw ImagePressError.cannotReadImage(input)
+        }
+
+        try control?.checkCancellation()
+
+        let optimizedText = optimizedSVGText(from: sourceText, settings: settings)
+        guard !optimizedText.isEmpty,
+              let optimizedData = optimizedText.data(using: .utf8) else {
+            throw ImagePressError.writeFailed(output)
+        }
+
+        let dataToWrite = optimizedData.count <= originalData.count ? optimizedData : originalData
+        try dataToWrite.write(to: output, options: .atomic)
+
+        try control?.checkCancellation()
+    }
+
+    private static func decodedSVGText(from data: Data) -> String? {
+        for encoding in [String.Encoding.utf8, .isoLatin1, .windowsCP1252] {
+            if let text = String(data: data, encoding: encoding) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    private static func optimizedSVGText(from text: String, settings: CompressionSettings) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let parsed = optimizedWithXMLDocument(normalized, stripMetadata: settings.stripMetadata)
+        let compacted = parsed ?? optimizedWithTextFallback(normalized, stripMetadata: settings.stripMetadata)
+        return removeExtraSpacesInsideTags(compacted)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func optimizedWithXMLDocument(_ text: String, stripMetadata: Bool) -> String? {
+        guard let document = try? XMLDocument(xmlString: text, options: [.nodeLoadExternalEntitiesNever]) else {
+            return nil
+        }
+
+        if stripMetadata {
+            removeMetadataNodes(from: document)
+        }
+
+        return removeXMLDeclaration(
+            document.xmlString(options: [.nodeCompactEmptyElement])
+        )
+    }
+
+    private static func removeMetadataNodes(from node: XMLNode) {
+        for child in node.children ?? [] {
+            if child.kind == .comment || child.name?.lowercased() == "metadata" {
+                child.detach()
+            } else {
+                removeMetadataNodes(from: child)
+            }
+        }
+    }
+
+    private static func optimizedWithTextFallback(_ text: String, stripMetadata: Bool) -> String {
+        var result = removeXMLDeclaration(text)
+
+        if stripMetadata {
+            result = replacingMatches(in: result, pattern: #"(?s)<!--.*?-->"#, with: "")
+            result = replacingMatches(in: result, pattern: #"(?is)<metadata\b[^>]*>.*?</metadata\s*>"#, with: "")
+        }
+
+        result = replacingMatches(in: result, pattern: #">\s+<"#, with: "><")
+        return result
+    }
+
+    private static func removeXMLDeclaration(_ text: String) -> String {
+        replacingMatches(in: text, pattern: #"(?is)^\s*<\?xml\b.*?\?>\s*"#, with: "")
+    }
+
+    private static func removeExtraSpacesInsideTags(_ text: String) -> String {
+        var output = ""
+        var tagBuffer = ""
+        var isInsideTag = false
+        var quote: Character?
+
+        for character in text {
+            if !isInsideTag {
+                if character == "<" {
+                    isInsideTag = true
+                    tagBuffer = "<"
+                } else {
+                    output.append(character)
+                }
+                continue
+            }
+
+            tagBuffer.append(character)
+
+            if let currentQuote = quote {
+                if character == currentQuote {
+                    quote = nil
+                }
+                continue
+            }
+
+            if character == "\"" || character == "'" {
+                quote = character
+            } else if character == ">" {
+                output += compactTag(tagBuffer)
+                tagBuffer = ""
+                isInsideTag = false
+            }
+        }
+
+        if !tagBuffer.isEmpty {
+            output += tagBuffer
+        }
+
+        return output
+    }
+
+    private static func compactTag(_ tag: String) -> String {
+        var output = ""
+        var previousWasWhitespace = false
+        var quote: Character?
+
+        for character in tag {
+            if let currentQuote = quote {
+                output.append(character)
+                if character == currentQuote {
+                    quote = nil
+                }
+                continue
+            }
+
+            if character == "\"" || character == "'" {
+                quote = character
+                output.append(character)
+                previousWasWhitespace = false
+            } else if character.isWhitespace {
+                previousWasWhitespace = true
+            } else {
+                if previousWasWhitespace,
+                   !output.isEmpty,
+                   output.last != "<",
+                   output.last != "=",
+                   character != "=",
+                   character != ">",
+                   character != "/" {
+                    output.append(" ")
+                }
+                output.append(character)
+                previousWasWhitespace = false
+            }
+        }
+
+        return output
+            .replacingOccurrences(of: " />", with: "/>")
+            .replacingOccurrences(of: " >", with: ">")
+            .replacingOccurrences(of: "= ", with: "=")
+            .replacingOccurrences(of: " =", with: "=")
+    }
+
+    private static func replacingMatches(in text: String, pattern: String, with replacement: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: replacement)
+    }
+}
+
 enum ImageFileFinder {
     private static let supportedExtensions: Set<String> = [
-        "jpg", "jpeg", "jpe", "png", "webp", "avif", "heic", "heif", "tif", "tiff",
+        "jpg", "jpeg", "jpe", "png", "svg", "webp", "avif", "heic", "heif", "tif", "tiff",
         "gif", "bmp", "ico", "jp2", "j2k", "jpf", "jpx", "psd",
         "dng", "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2",
         "orf", "rw2", "raf", "pef", "rwl", "iiq", "3fr", "fff"
@@ -1555,6 +1763,13 @@ enum ImageFileFinder {
 
     private static func isSupported(_ url: URL) -> Bool {
         supportedExtensions.contains(url.pathExtension.lowercased())
+    }
+}
+
+extension URL {
+    var isSVGFile: Bool {
+        let fileExtension = pathExtension.lowercased()
+        return fileExtension == "svg"
     }
 }
 
@@ -1830,6 +2045,34 @@ enum SelfTest {
             print("AVIF no-growth ok: \(avifNoGrowth.lastPathComponent)")
         }
 
+        let svgSource = root.appendingPathComponent("source.svg")
+        try makeTestSVG(at: svgSource)
+        let svgSettings = CompressionSettings(
+            outputFormat: .svg,
+            quality: 80,
+            method: .balanced,
+            stripMetadata: true,
+            maxPixelEdge: 0
+        )
+        let svg = try ImageCompressor.compress(input: svgSource, outputDirectory: output, settings: svgSettings, usedFileNames: &usedNames)
+        let svgText = try String(contentsOf: svg, encoding: .utf8)
+        guard svg.pathExtension == "svg",
+              FileUtilities.fileSize(svg) < FileUtilities.fileSize(svgSource),
+              svgText.contains("<svg"),
+              !svgText.contains("<metadata"),
+              !svgText.contains("<!--") else {
+            throw ImagePressError.processFailed("SVG compression did not produce a smaller clean SVG")
+        }
+        print("SVG ok: \(svg.lastPathComponent)")
+
+        let tinySVGSource = root.appendingPathComponent("tiny.svg")
+        try "<svg xmlns=\"http://www.w3.org/2000/svg\"/>".write(to: tinySVGSource, atomically: true, encoding: .utf8)
+        let tinySVG = try ImageCompressor.compress(input: tinySVGSource, outputDirectory: output, settings: svgSettings, usedFileNames: &usedNames)
+        guard FileUtilities.fileSize(tinySVG) <= FileUtilities.fileSize(tinySVGSource) else {
+            throw ImagePressError.processFailed("SVG output grew from \(FileUtilities.fileSize(tinySVGSource)) to \(FileUtilities.fileSize(tinySVG)) bytes")
+        }
+        print("SVG no-growth ok: \(tinySVG.lastPathComponent)")
+
         let zipWorkParent = FileManager.default.temporaryDirectory
             .appendingPathComponent("ImagePress-\(UUID().uuidString)", isDirectory: true)
         let zipWorkFolder = zipWorkParent.appendingPathComponent("ImagePress Export Test", isDirectory: true)
@@ -1895,5 +2138,41 @@ enum SelfTest {
         guard CGImageDestinationFinalize(destination) else {
             throw ImagePressError.writeFailed(url)
         }
+    }
+
+    private static func makeTestSVG(at url: URL) throws {
+        let svg = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="320"
+            height="180"
+            viewBox="0 0 320 180">
+            <!-- Created by ImagePress self-test -->
+            <metadata>
+                <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+                    <rdf:Description>Temporary test metadata</rdf:Description>
+                </rdf:RDF>
+            </metadata>
+            <title>ImagePress SVG test</title>
+            <rect
+                x="0"
+                y="0"
+                width="320"
+                height="180"
+                fill="#74b957" />
+            <circle
+                cx="92"
+                cy="88"
+                r="46"
+                fill="#ffffff"
+                opacity="0.82" />
+            <path
+                d="M 166 52 L 238 52 L 238 126 L 166 126 Z"
+                fill="#1f2933"
+                opacity="0.35" />
+        </svg>
+        """
+        try svg.write(to: url, atomically: true, encoding: .utf8)
     }
 }

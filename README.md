@@ -5,7 +5,7 @@ ImagePress is a native macOS batch image compressor. It runs locally, supports l
 ## Features
 
 - Drag in images or folders.
-- Export to JPEG, PNG, WebP, AVIF, HEIC, TIFF, GIF, BMP, or JPEG 2000.
+- Export to JPEG, PNG, SVG, WebP, AVIF, HEIC, TIFF, GIF, BMP, or JPEG 2000.
 - Keep the original format when possible.
 - Adjust quality and compression method.
 - Optionally strip metadata.
@@ -54,12 +54,12 @@ ditto outputs/ImagePress.app /Applications/ImagePress.app
 To create a release DMG:
 
 ```sh
-zsh work/ImagePress/package_dmg.sh 1.0.1
+zsh work/ImagePress/package_dmg.sh 1.1.0
 ```
 
 ## Test
 
-The app includes a small self-test for JPEG, WebP, AVIF, zip cleanup, and cancellation:
+The app includes a small self-test for JPEG, PNG, WebP, AVIF, SVG, zip cleanup, and cancellation:
 
 ```sh
 outputs/ImagePress.app/Contents/MacOS/ImagePress --self-test
