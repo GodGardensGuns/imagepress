@@ -160,15 +160,26 @@ struct ContentView: View {
                         .help("Optional pixel limit for the image's longest side. Leave blank to keep original dimensions.")
                 }
 
+                Spacer()
+            }
+
+            HStack(alignment: .center, spacing: 12) {
                 Button {
-                    model.compress(makeZip: false)
+                    model.compress(mode: .inPlace)
+                } label: {
+                    Label("Export In Place", systemImage: "arrow.down.doc")
+                }
+                .disabled(model.items.isEmpty || model.isWorking)
+
+                Button {
+                    model.compress(mode: .folder)
                 } label: {
                     Label("Export Folder", systemImage: "folder")
                 }
                 .disabled(model.items.isEmpty || model.isWorking)
 
                 Button {
-                    model.compress(makeZip: true)
+                    model.compress(mode: .zip)
                 } label: {
                     Label("Export Zip", systemImage: "archivebox")
                 }
@@ -414,6 +425,12 @@ struct FocusBehaviorInstaller: NSViewRepresentable {
     }
 }
 
+enum ExportMode {
+    case folder
+    case zip
+    case inPlace
+}
+
 @MainActor
 final class CompressorModel: ObservableObject {
     @Published var items: [ImageJob] = []
@@ -428,6 +445,7 @@ final class CompressorModel: ObservableObject {
     @Published var alertText: String?
     @Published private var lastOutputFolder: URL?
     @Published private var lastZipFile: URL?
+    @Published private var lastOutputItems: [URL] = []
     private var compressionTask: Task<Void, Never>?
     private var currentRunControl: CompressionRunControl?
 
@@ -437,7 +455,7 @@ final class CompressorModel: ObservableObject {
     }
 
     var canRevealOutput: Bool {
-        lastZipFile != nil || lastOutputFolder != nil
+        lastZipFile != nil || lastOutputFolder != nil || !lastOutputItems.isEmpty
     }
 
     var summaryText: String {
@@ -505,6 +523,7 @@ final class CompressorModel: ObservableObject {
         isCancelling = false
         lastOutputFolder = nil
         lastZipFile = nil
+        lastOutputItems = []
     }
 
     func cancelCompression() {
@@ -514,7 +533,7 @@ final class CompressorModel: ObservableObject {
         currentRunControl?.cancel()
     }
 
-    func compress(makeZip: Bool) {
+    func compress(mode: ExportMode) {
         guard !items.isEmpty else {
             alertText = "Add images first."
             return
@@ -525,9 +544,14 @@ final class CompressorModel: ObservableObject {
             return
         }
 
+        if mode == .inPlace {
+            confirmInPlaceExport(maxEdge: maxEdge)
+            return
+        }
+
         let panel = NSOpenPanel()
         panel.title = "Choose output folder"
-        panel.prompt = makeZip ? "Export Zip" : "Export"
+        panel.prompt = mode == .zip ? "Export Zip" : "Export"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
@@ -535,7 +559,7 @@ final class CompressorModel: ObservableObject {
         panel.begin { [weak self] response in
             guard let self, response == .OK, let destination = panel.url else { return }
             Task { @MainActor in
-                self.startCompression(in: destination, makeZip: makeZip, maxEdge: maxEdge)
+                self.startCompression(in: destination, mode: mode, maxEdge: maxEdge)
             }
         }
     }
@@ -543,9 +567,23 @@ final class CompressorModel: ObservableObject {
     func revealOutput() {
         if let lastZipFile {
             NSWorkspace.shared.activateFileViewerSelecting([lastZipFile])
+        } else if !lastOutputItems.isEmpty {
+            NSWorkspace.shared.activateFileViewerSelecting(lastOutputItems)
         } else if let lastOutputFolder {
             NSWorkspace.shared.activateFileViewerSelecting([lastOutputFolder])
         }
+    }
+
+    private func confirmInPlaceExport(maxEdge: Int) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Export in place?"
+        alert.informativeText = "Same-format exports replace the original files after compression succeeds. Format conversions are saved next to the originals instead."
+        alert.addButton(withTitle: "Export In Place")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        startCompression(in: nil, mode: .inPlace, maxEdge: maxEdge)
     }
 
     private var parsedMaxEdge: Int? {
@@ -555,12 +593,13 @@ final class CompressorModel: ObservableObject {
         return value
     }
 
-    private func startCompression(in destination: URL, makeZip: Bool, maxEdge: Int) {
+    private func startCompression(in destination: URL?, mode: ExportMode, maxEdge: Int) {
         isWorking = true
         isCancelling = false
         completedCount = 0
         lastOutputFolder = nil
         lastZipFile = nil
+        lastOutputItems = []
         compressionTask?.cancel()
 
         for index in items.indices {
@@ -576,18 +615,21 @@ final class CompressorModel: ObservableObject {
         )
         let jobs = items
         let exportFolder: URL
+        let temporaryRoot: URL?
         let exportBaseName = "ImagePress Export \(FileUtilities.timestamp())"
 
         do {
-            if makeZip {
-                exportFolder = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("ImagePress-\(UUID().uuidString)", isDirectory: true)
-                    .appendingPathComponent(exportBaseName, isDirectory: true)
-            } else {
+            if mode == .folder, let destination {
                 exportFolder = try FileUtilities.uniqueDirectory(
                     parent: destination,
                     baseName: exportBaseName
                 )
+                temporaryRoot = nil
+            } else {
+                temporaryRoot = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("ImagePress-\(UUID().uuidString)", isDirectory: true)
+                exportFolder = temporaryRoot!
+                    .appendingPathComponent(exportBaseName, isDirectory: true)
             }
             try FileManager.default.createDirectory(at: exportFolder, withIntermediateDirectories: true)
         } catch {
@@ -601,6 +643,8 @@ final class CompressorModel: ObservableObject {
 
         compressionTask = Task.detached(priority: .userInitiated) {
             var usedNames = Set<String>()
+            var inPlaceUsedNamesByDirectory: [String: Set<String>] = [:]
+            var inPlaceOutputs: [URL] = []
             var wasCancelled = false
 
             for job in jobs {
@@ -628,10 +672,22 @@ final class CompressorModel: ObservableObject {
                         control: runControl
                     )
                     try runControl.checkCancellation()
-                    let outputSize = FileUtilities.fileSize(outputURL)
+                    let finalOutputURL: URL
+                    if mode == .inPlace {
+                        finalOutputURL = try InPlaceExporter.install(
+                            original: job.url,
+                            compressed: outputURL,
+                            settings: settings,
+                            usedFileNamesByDirectory: &inPlaceUsedNamesByDirectory
+                        )
+                        inPlaceOutputs.append(finalOutputURL)
+                    } else {
+                        finalOutputURL = outputURL
+                    }
+                    let outputSize = FileUtilities.fileSize(finalOutputURL)
                     await MainActor.run {
                         self.updateJob(id: job.id) { item in
-                            item.outputURL = outputURL
+                            item.outputURL = finalOutputURL
                             item.outputSize = outputSize
                             item.status = .done
                         }
@@ -657,7 +713,7 @@ final class CompressorModel: ObservableObject {
             }
 
             var zipURL: URL?
-            if makeZip && !wasCancelled {
+            if mode == .zip && !wasCancelled, let destination {
                 do {
                     try runControl.checkCancellation()
                     zipURL = try FileUtilities.uniqueFile(parent: destination, baseName: exportBaseName, extensionName: "zip")
@@ -672,12 +728,15 @@ final class CompressorModel: ObservableObject {
                         self.alertText = "Zip export failed: \(error.localizedDescription)"
                     }
                 }
+            }
 
-                try? FileManager.default.removeItem(at: exportFolder.deletingLastPathComponent())
+            if mode != .folder, let temporaryRoot {
+                try? FileManager.default.removeItem(at: temporaryRoot)
             }
 
             let finalZipURL = wasCancelled ? nil : zipURL
-            let finalOutputFolder = makeZip ? nil : exportFolder
+            let finalOutputFolder = mode == .folder ? exportFolder : nil
+            let finalOutputItems = wasCancelled ? [] : inPlaceOutputs
             let finalWasCancelled = wasCancelled
             await MainActor.run {
                 if finalWasCancelled {
@@ -685,6 +744,7 @@ final class CompressorModel: ObservableObject {
                 }
                 self.lastOutputFolder = finalOutputFolder
                 self.lastZipFile = finalZipURL
+                self.lastOutputItems = finalOutputItems
                 self.isWorking = false
                 self.isCancelling = false
                 self.currentRunControl = nil
@@ -1773,6 +1833,50 @@ extension URL {
     }
 }
 
+enum InPlaceExporter {
+    static func install(
+        original: URL,
+        compressed: URL,
+        settings: CompressionSettings,
+        usedFileNamesByDirectory: inout [String: Set<String>]
+    ) throws -> URL {
+        if shouldReplaceOriginal(original: original, settings: settings) {
+            return try replaceOriginal(original, with: compressed)
+        }
+
+        let format = OutputFormat.resolved(for: original, requested: settings.outputFormat)
+        let parent = original.deletingLastPathComponent()
+        let directoryKey = parent.standardizedFileURL.path
+        var usedFileNames = usedFileNamesByDirectory[directoryKey] ?? Set<String>()
+        let destination = try FileUtilities.uniqueFile(
+            parent: parent,
+            baseName: original.deletingPathExtension().lastPathComponent,
+            extensionName: format.fileExtension,
+            usedFileNames: &usedFileNames
+        )
+        usedFileNamesByDirectory[directoryKey] = usedFileNames
+
+        try FileManager.default.moveItem(at: compressed, to: destination)
+        return destination
+    }
+
+    static func shouldReplaceOriginal(original: URL, settings: CompressionSettings) -> Bool {
+        let originalFormat = OutputFormat.resolved(for: original, requested: .same)
+        let outputFormat = OutputFormat.resolved(for: original, requested: settings.outputFormat)
+        return originalFormat == outputFormat
+    }
+
+    private static func replaceOriginal(_ original: URL, with compressed: URL) throws -> URL {
+        let replacement = try FileManager.default.replaceItemAt(
+            original,
+            withItemAt: compressed,
+            backupItemName: nil,
+            options: []
+        )
+        return replacement ?? original
+    }
+}
+
 enum FileUtilities {
     static func fileSize(_ url: URL) -> Int64 {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -2072,6 +2176,50 @@ enum SelfTest {
             throw ImagePressError.processFailed("SVG output grew from \(FileUtilities.fileSize(tinySVGSource)) to \(FileUtilities.fileSize(tinySVG)) bytes")
         }
         print("SVG no-growth ok: \(tinySVG.lastPathComponent)")
+
+        let inPlaceRoot = root.appendingPathComponent("in-place", isDirectory: true)
+        try FileManager.default.createDirectory(at: inPlaceRoot, withIntermediateDirectories: true)
+
+        let inPlaceSVGSource = inPlaceRoot.appendingPathComponent("replace.svg")
+        try makeTestSVG(at: inPlaceSVGSource)
+        let inPlaceSVGOriginalSize = FileUtilities.fileSize(inPlaceSVGSource)
+        let compressedInPlaceSVG = try ImageCompressor.compress(input: inPlaceSVGSource, outputDirectory: output, settings: svgSettings, usedFileNames: &usedNames)
+        var inPlaceUsedNamesByDirectory: [String: Set<String>] = [:]
+        let replacedSVG = try InPlaceExporter.install(
+            original: inPlaceSVGSource,
+            compressed: compressedInPlaceSVG,
+            settings: svgSettings,
+            usedFileNamesByDirectory: &inPlaceUsedNamesByDirectory
+        )
+        guard replacedSVG.standardizedFileURL.path == inPlaceSVGSource.standardizedFileURL.path,
+              FileUtilities.fileSize(inPlaceSVGSource) < inPlaceSVGOriginalSize else {
+            throw ImagePressError.processFailed("In-place same-format export did not replace the original")
+        }
+        print("In-place replace ok: \(replacedSVG.lastPathComponent)")
+
+        let inPlacePNGSource = inPlaceRoot.appendingPathComponent("convert.png")
+        try makeTestPNG(at: inPlacePNGSource)
+        let inPlaceJPEGSettings = CompressionSettings(
+            outputFormat: .jpeg,
+            quality: 72,
+            method: .balanced,
+            stripMetadata: true,
+            maxPixelEdge: 0
+        )
+        let compressedInPlaceJPEG = try ImageCompressor.compress(input: inPlacePNGSource, outputDirectory: output, settings: inPlaceJPEGSettings, usedFileNames: &usedNames)
+        let convertedJPEG = try InPlaceExporter.install(
+            original: inPlacePNGSource,
+            compressed: compressedInPlaceJPEG,
+            settings: inPlaceJPEGSettings,
+            usedFileNamesByDirectory: &inPlaceUsedNamesByDirectory
+        )
+        guard convertedJPEG.deletingLastPathComponent().standardizedFileURL.path == inPlaceRoot.standardizedFileURL.path,
+              convertedJPEG.pathExtension == "jpg",
+              FileManager.default.fileExists(atPath: inPlacePNGSource.path),
+              FileManager.default.fileExists(atPath: convertedJPEG.path) else {
+            throw ImagePressError.processFailed("In-place conversion did not save beside the original")
+        }
+        print("In-place conversion ok: \(convertedJPEG.lastPathComponent)")
 
         let zipWorkParent = FileManager.default.temporaryDirectory
             .appendingPathComponent("ImagePress-\(UUID().uuidString)", isDirectory: true)
