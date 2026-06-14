@@ -1152,6 +1152,11 @@ enum ImageCompressor {
         }
 
         try control?.checkCancellation()
+        if shouldPreferOriginal(input: input, output: outputURL, format: format, settings: settings) {
+            try? FileManager.default.removeItem(at: outputURL)
+            try FileManager.default.copyItem(at: input, to: outputURL)
+        }
+
         return outputURL
     }
 
@@ -1555,8 +1560,8 @@ enum ImageFileFinder {
 
 enum FileUtilities {
     static func fileSize(_ url: URL) -> Int64 {
-        let values = try? url.resourceValues(forKeys: [.fileSizeKey])
-        return Int64(values?.fileSize ?? 0)
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return attributes?[.size] as? Int64 ?? 0
     }
 
     static func timestamp() -> String {
@@ -1783,11 +1788,24 @@ enum SelfTest {
         if WebPEncoderLocator.executableURL() != nil {
             let webp = try ImageCompressor.compress(input: source, outputDirectory: output, settings: webPSettings, usedFileNames: &usedNames)
             print("WebP ok: \(webp.lastPathComponent)")
+
+            let webPNoGrowthSettings = CompressionSettings(
+                outputFormat: .webp,
+                quality: 100,
+                method: .lossless,
+                stripMetadata: true,
+                maxPixelEdge: 0
+            )
+            let webpNoGrowth = try ImageCompressor.compress(input: webp, outputDirectory: output, settings: webPNoGrowthSettings, usedFileNames: &usedNames)
+            guard FileUtilities.fileSize(webpNoGrowth) <= FileUtilities.fileSize(webp) else {
+                throw ImagePressError.processFailed("WebP output grew from \(FileUtilities.fileSize(webp)) to \(FileUtilities.fileSize(webpNoGrowth)) bytes")
+            }
+            print("WebP no-growth ok: \(webpNoGrowth.lastPathComponent)")
         } else {
             print("WebP skipped: cwebp missing")
         }
 
-        if OutputFormat.writableTypeIdentifiers.contains("public.avif") {
+        if AVIFEncoderLocator.executableURL() != nil {
             let avifSettings = CompressionSettings(
                 outputFormat: .avif,
                 quality: 72,
@@ -1797,6 +1815,19 @@ enum SelfTest {
             )
             let avif = try ImageCompressor.compress(input: source, outputDirectory: output, settings: avifSettings, usedFileNames: &usedNames)
             print("AVIF ok: \(avif.lastPathComponent)")
+
+            let avifNoGrowthSettings = CompressionSettings(
+                outputFormat: .avif,
+                quality: 100,
+                method: .lossless,
+                stripMetadata: true,
+                maxPixelEdge: 0
+            )
+            let avifNoGrowth = try ImageCompressor.compress(input: avif, outputDirectory: output, settings: avifNoGrowthSettings, usedFileNames: &usedNames)
+            guard FileUtilities.fileSize(avifNoGrowth) <= FileUtilities.fileSize(avif) else {
+                throw ImagePressError.processFailed("AVIF output grew from \(FileUtilities.fileSize(avif)) to \(FileUtilities.fileSize(avifNoGrowth)) bytes")
+            }
+            print("AVIF no-growth ok: \(avifNoGrowth.lastPathComponent)")
         }
 
         let zipWorkParent = FileManager.default.temporaryDirectory
