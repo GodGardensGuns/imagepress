@@ -14,19 +14,24 @@ ImagePress is a native macOS batch image compressor. It runs locally, supports l
 - Cancel a running compression job.
 - Includes light and dark app icon assets.
 
-## Requirements
+## Download
+
+Download the latest `.dmg` from the GitHub Releases tab, open it, and drag `ImagePress.app` into `Applications`.
+
+The release app is self-contained. You do not need Homebrew, Xcode command line tools, `cwebp`, or `avifenc` to run it.
+
+Current release builds are for Apple Silicon Macs.
+
+## Build From Source
+
+Building from source requires:
 
 - macOS with Xcode command line tools.
-- `cwebp` for WebP export.
-- `avifenc` for AVIF export.
-
-If you use Homebrew:
+- Homebrew-installed encoder packages, because the build script copies them into the app bundle.
 
 ```sh
 brew install webp libavif
 ```
-
-## Build
 
 From the repo root:
 
@@ -46,6 +51,12 @@ To install locally:
 ditto outputs/ImagePress.app /Applications/ImagePress.app
 ```
 
+To create a release DMG:
+
+```sh
+zsh work/ImagePress/package_dmg.sh 1.0.0
+```
+
 ## Test
 
 The app includes a small self-test for JPEG, WebP, AVIF, zip cleanup, and cancellation:
@@ -62,3 +73,5 @@ outputs/ImagePress.app/Contents/MacOS/ImagePress --self-test
 ## License
 
 ImagePress is licensed under the GNU General Public License v3.0. See `LICENSE`.
+
+Release builds include bundled encoder components. Their notices are listed in `THIRD_PARTY_NOTICES.md`, and their license files are copied into the app bundle under `Contents/Resources/ThirdPartyLicenses/`.

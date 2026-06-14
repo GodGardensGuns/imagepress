@@ -3,6 +3,7 @@
 # Build and generated output
 outputs/
 work/build/
+work/dmg-staging/
 work/module-cache/
 
 # Swift and Xcode local noise
