@@ -63,7 +63,9 @@ patch_runtime_dependencies() {
 copy_encoder_runtimes() {
   copy_runtime_file "/opt/homebrew/bin/cwebp" "$APP/Contents/Resources/bin/cwebp"
   copy_runtime_file "/opt/homebrew/bin/avifenc" "$APP/Contents/Resources/bin/avifenc"
-  chmod 755 "$APP/Contents/Resources/bin/cwebp" "$APP/Contents/Resources/bin/avifenc"
+  copy_runtime_file "/opt/homebrew/bin/pngquant" "$APP/Contents/Resources/bin/pngquant"
+  copy_runtime_file "/opt/homebrew/bin/oxipng" "$APP/Contents/Resources/bin/oxipng"
+  chmod 755 "$APP/Contents/Resources/bin/cwebp" "$APP/Contents/Resources/bin/avifenc" "$APP/Contents/Resources/bin/pngquant" "$APP/Contents/Resources/bin/oxipng"
 
   local libraries=(
     "/opt/homebrew/lib/libwebpdemux.2.dylib"
@@ -78,6 +80,7 @@ copy_encoder_runtimes() {
     "/opt/homebrew/opt/libvmaf/lib/libvmaf.3.dylib"
     "/opt/homebrew/opt/zstd/lib/libzstd.1.dylib"
     "/opt/homebrew/opt/xz/lib/liblzma.5.dylib"
+    "/opt/homebrew/opt/little-cms2/lib/liblcms2.2.dylib"
   )
 
   for library in "${libraries[@]}"; do
@@ -91,6 +94,8 @@ copy_encoder_runtimes() {
 
   patch_runtime_dependencies "$APP/Contents/Resources/bin/cwebp" "@loader_path/../lib"
   patch_runtime_dependencies "$APP/Contents/Resources/bin/avifenc" "@loader_path/../lib"
+  patch_runtime_dependencies "$APP/Contents/Resources/bin/pngquant" "@loader_path/../lib"
+  patch_runtime_dependencies "$APP/Contents/Resources/bin/oxipng" "@loader_path/../lib"
 
   local license_sources=(
     "/opt/homebrew/Cellar/webp/1.6.0/COPYING:webp-COPYING.txt"
@@ -103,6 +108,9 @@ copy_encoder_runtimes() {
     "/opt/homebrew/Cellar/zstd/1.5.7_1/LICENSE:zstd-LICENSE.txt"
     "/opt/homebrew/Cellar/xz/5.8.3/COPYING:xz-COPYING.txt"
     "/opt/homebrew/Cellar/libvmaf/3.1.0/LICENSE:libvmaf-LICENSE.txt"
+    "/opt/homebrew/Cellar/pngquant/3.0.3/COPYRIGHT:pngquant-COPYRIGHT.txt"
+    "/opt/homebrew/Cellar/oxipng/10.1.1/LICENSE:oxipng-LICENSE.txt"
+    "/opt/homebrew/Cellar/little-cms2/2.19/LICENSE:little-cms2-LICENSE.txt"
   )
 
   for entry in "${license_sources[@]}"; do

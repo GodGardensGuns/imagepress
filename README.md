@@ -30,7 +30,7 @@ Building from source requires:
 - Homebrew-installed encoder packages, because the build script copies them into the app bundle.
 
 ```sh
-brew install webp libavif
+brew install webp libavif pngquant oxipng
 ```
 
 From the repo root:
@@ -54,7 +54,7 @@ ditto outputs/ImagePress.app /Applications/ImagePress.app
 To create a release DMG:
 
 ```sh
-zsh work/ImagePress/package_dmg.sh 1.0.0
+zsh work/ImagePress/package_dmg.sh 1.0.1
 ```
 
 ## Test

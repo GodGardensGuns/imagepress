@@ -987,6 +987,45 @@ enum CompressionMethod: String, CaseIterable, Identifiable {
         arguments += [input.path, output.path]
         return arguments
     }
+
+    func pngQuantArguments(quality: Double, input: URL, output: URL, stripMetadata: Bool) -> [String] {
+        let maxQuality = max(35, min(95, Int(quality.rounded())))
+        let minQuality = max(5, maxQuality - 30)
+        var arguments = [
+            "--force",
+            "--quality", "\(minQuality)-\(maxQuality)",
+            "--speed", "1",
+            "--output", output.path
+        ]
+
+        if stripMetadata {
+            arguments.append("--strip")
+        }
+
+        arguments += ["--", input.path]
+        return arguments
+    }
+
+    func oxiPNGArguments(input: URL, output: URL, stripMetadata: Bool) -> [String] {
+        let level: String
+        switch self {
+        case .balanced:
+            level = "3"
+        case .smaller:
+            level = "5"
+        case .detail:
+            level = "2"
+        case .lossless:
+            level = "4"
+        }
+
+        var arguments = ["--quiet", "--opt", level, "--out", output.path]
+        if stripMetadata {
+            arguments += ["--strip", "safe"]
+        }
+        arguments.append(input.path)
+        return arguments
+    }
 }
 
 struct CompressionSettings {
@@ -1102,6 +1141,8 @@ enum ImageCompressor {
                 try encodeWebP(source: source, input: input, output: outputURL, settings: settings, control: control)
             } else if format == .avif {
                 try encodeAVIF(source: source, input: input, output: outputURL, settings: settings, control: control)
+            } else if format == .png {
+                try encodePNG(source: source, input: input, output: outputURL, settings: settings, control: control)
             } else {
                 try encodeImageIO(source: source, input: input, output: outputURL, format: format, settings: settings, control: control)
             }
@@ -1112,6 +1153,93 @@ enum ImageCompressor {
 
         try control?.checkCancellation()
         return outputURL
+    }
+
+    private static func encodePNG(
+        source: CGImageSource,
+        input: URL,
+        output: URL,
+        settings: CompressionSettings,
+        control: CompressionRunControl?
+    ) throws {
+        try control?.checkCancellation()
+
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ImagePress-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let rawPNG = tempDirectory.appendingPathComponent("raw.png")
+        let quantizedPNG = tempDirectory.appendingPathComponent("quantized.png")
+        let optimizedPNG = tempDirectory.appendingPathComponent("optimized.png")
+        let image = try imageForPNGCompatibleEncoding(
+            transformedImage(from: source, input: input, maxPixelEdge: settings.maxPixelEdge)
+        )
+
+        guard let destination = CGImageDestinationCreateWithURL(rawPNG as CFURL, "public.png" as CFString, 1, nil) else {
+            throw ImagePressError.cannotCreateDestination(rawPNG)
+        }
+        CGImageDestinationAddImage(destination, image, destinationProperties(from: source, format: .png, settings: settings))
+        guard CGImageDestinationFinalize(destination) else {
+            throw ImagePressError.writeFailed(rawPNG)
+        }
+
+        try control?.checkCancellation()
+
+        var candidate = rawPNG
+        if settings.method == .smaller, let pngquantURL = PNGQuantLocator.executableURL() {
+            do {
+                try ProcessRunner.run(
+                    executable: pngquantURL,
+                    arguments: settings.method.pngQuantArguments(
+                        quality: settings.quality,
+                        input: rawPNG,
+                        output: quantizedPNG,
+                        stripMetadata: settings.stripMetadata
+                    ),
+                    control: control
+                )
+                if FileManager.default.fileExists(atPath: quantizedPNG.path) {
+                    candidate = quantizedPNG
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                candidate = rawPNG
+            }
+        }
+
+        try control?.checkCancellation()
+
+        if let oxipngURL = OxiPNGLocator.executableURL() {
+            do {
+                try ProcessRunner.run(
+                    executable: oxipngURL,
+                    arguments: settings.method.oxiPNGArguments(
+                        input: candidate,
+                        output: optimizedPNG,
+                        stripMetadata: settings.stripMetadata
+                    ),
+                    control: control
+                )
+                if FileManager.default.fileExists(atPath: optimizedPNG.path) {
+                    candidate = optimizedPNG
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Keep the best candidate we already have.
+            }
+        }
+
+        try FileManager.default.copyItem(at: candidate, to: output)
+
+        if shouldPreferOriginalPNG(input: input, output: output, settings: settings) {
+            try? FileManager.default.removeItem(at: output)
+            try FileManager.default.copyItem(at: input, to: output)
+        }
+
+        try control?.checkCancellation()
     }
 
     private static func encodeImageIO(
@@ -1150,6 +1278,11 @@ enum ImageCompressor {
         }
 
         try control?.checkCancellation()
+
+        if shouldPreferOriginal(input: input, output: output, format: format, settings: settings) {
+            try? FileManager.default.removeItem(at: output)
+            try FileManager.default.copyItem(at: input, to: output)
+        }
     }
 
     private static func encodeWebP(
@@ -1299,6 +1432,29 @@ enum ImageCompressor {
         }
 
         return properties
+    }
+
+    private static func shouldPreferOriginal(
+        input: URL,
+        output: URL,
+        format: OutputFormat,
+        settings: CompressionSettings
+    ) -> Bool {
+        guard settings.maxPixelEdge == 0 else { return false }
+        guard OutputFormat.resolved(for: input, requested: .same) == format else { return false }
+
+        let originalSize = FileUtilities.fileSize(input)
+        let outputSize = FileUtilities.fileSize(output)
+        return originalSize > 0 && outputSize > originalSize
+    }
+
+    private static func shouldPreferOriginalPNG(input: URL, output: URL, settings: CompressionSettings) -> Bool {
+        guard settings.maxPixelEdge == 0 else { return false }
+        guard input.pathExtension.lowercased() == "png" else { return false }
+
+        let originalSize = FileUtilities.fileSize(input)
+        let outputSize = FileUtilities.fileSize(output)
+        return originalSize > 0 && outputSize > originalSize
     }
 
     private static func flattenedOverWhite(_ image: CGImage) throws -> CGImage {
@@ -1483,6 +1639,36 @@ enum AVIFEncoderLocator {
     }
 }
 
+enum PNGQuantLocator {
+    static func executableURL() -> URL? {
+        if let bundled = Bundle.main.url(forResource: "pngquant", withExtension: nil, subdirectory: "bin"),
+           FileManager.default.isExecutableFile(atPath: bundled.path) {
+            return bundled
+        }
+
+        for path in ["/opt/homebrew/bin/pngquant", "/usr/local/bin/pngquant"] where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+
+        return nil
+    }
+}
+
+enum OxiPNGLocator {
+    static func executableURL() -> URL? {
+        if let bundled = Bundle.main.url(forResource: "oxipng", withExtension: nil, subdirectory: "bin"),
+           FileManager.default.isExecutableFile(atPath: bundled.path) {
+            return bundled
+        }
+
+        for path in ["/opt/homebrew/bin/oxipng", "/usr/local/bin/oxipng"] where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+
+        return nil
+    }
+}
+
 enum ProcessRunner {
     static func run(
         executable: URL,
@@ -1572,6 +1758,19 @@ enum SelfTest {
         )
         let jpeg = try ImageCompressor.compress(input: source, outputDirectory: output, settings: settings, usedFileNames: &usedNames)
         print("JPEG ok: \(jpeg.lastPathComponent)")
+
+        let pngSettings = CompressionSettings(
+            outputFormat: .png,
+            quality: 70,
+            method: .smaller,
+            stripMetadata: true,
+            maxPixelEdge: 0
+        )
+        let png = try ImageCompressor.compress(input: source, outputDirectory: output, settings: pngSettings, usedFileNames: &usedNames)
+        guard FileUtilities.fileSize(png) <= FileUtilities.fileSize(source) else {
+            throw ImagePressError.processFailed("PNG output grew from \(FileUtilities.fileSize(source)) to \(FileUtilities.fileSize(png)) bytes")
+        }
+        print("PNG no-growth ok: \(png.lastPathComponent)")
 
         var webPSettings = settings
         webPSettings = CompressionSettings(

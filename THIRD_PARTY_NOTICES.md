@@ -14,6 +14,9 @@ Bundled components:
 - zstd
 - xz/liblzma
 - libvmaf
+- pngquant
+- oxipng
+- Little CMS
 
 Their license files are copied into the app bundle at:
 
